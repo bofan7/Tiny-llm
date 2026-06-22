@@ -427,48 +427,106 @@ class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
-        # 门控网络路由器 (Gate)：接收 hidden_size 维度的 Token，输出分配给每个专家的原始打分 (Logits)
+        # 【路由器】：一个简单的线性层。
+        # 它的输入是 Token 的维度 (hidden_size)，输出是每个专家的打分 (num_experts)。
+        # 比如有 8 个专家，它就输出 8 个数字。
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        # 专家列表 (Experts)：包含多个并行的、结构完全相同的 FeedForward 模块
-        self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        
+        # 【专家列表】：用 ModuleList 装了好多台“一模一样”的 FeedForward 机器
+        self.experts = nn.ModuleList([
+            FeedForward(config, intermediate_size=config.moe_intermediate_size) 
+            for _ in range(config.num_experts)
+        ])
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         batch_size, seq_len, hidden_dim = x.shape
-        x_flat = x.view(-1, hidden_dim) # 扁平化为二维 Token 集合 [BatchSize * SeqLen, HiddenDim]
+        # 把输入从三维 [批次, 句子长度, 维度] 拍扁成二维 [Token总数, 维度]
+        # 因为路由器和专家都是针对单个 Token 进行处理的
+        x_flat = x.view(-1, hidden_dim) 
         
-        # 1. 路由器对每个 Token 分配给各专家的概率打分
-        scores = F.softmax(self.gate(x_flat), dim=-1) # [NumTokens, NumExperts]
+        # ----------------------------------------------------
+        # 步骤 1: 路由器发工单
+        # ----------------------------------------------------
+        # self.gate(x_flat) 算出每个 Token 对每个专家的原始得分
+        # F.softmax 让得分变成概率（相加等于 1）
+        # scores 的形状是: [Token总数, 专家总数]
+        scores = F.softmax(self.gate(x_flat), dim=-1) 
         
-        # 2. 选择分值最高的前 K 个专家 (Top-K)，MiniMind 默认 num_experts_per_tok = 1 
+        # ----------------------------------------------------
+        # 步骤 2 & 3: 选出最强的专家 (Top-K)
+        # ----------------------------------------------------
+        # torch.topk 选出概率最大的前 K 个。这里 K=1
+        # topk_weight: 这个专家的权重（概率值）
+        # topk_idx: 这个专家的编号（比如是 0 号专家还是 3 号专家）
         topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
-        
-        # 3. 对 Top-K 的路由权重进行重新归一化 (若 K=1 则权重退化为 1.0)
+        """
+        topk_idx =
+        [
+        [2, 1],    token0 -> expert2, expert1
+        [0, 2],    token1 -> expert0, expert2
+        [1, 3],    token2 -> expert1, expert3
+        ]
+
+        topk_weight =
+        [
+        [0.7, 0.3],
+        [0.8, 0.2],
+        [0.6, 0.4],
+        ]
+        """
+        # 这里的 topk_weight 是路由器(Router)分配给 Top-K 专家的打分(概率标量)，而非专家内部的矩阵参数。
+        # 如果 K > 1，截取出的 Top-K 概率之和通常小于 1。为了防止加权求和时丢失信息（导致特征数值整体变小），
+        # 需要对这 K 个得分重新归一化 (Re-normalize)，使它们的和强制等于 1。
+        # (加上 1e-20 是为了防止极端情况下分母为 0 导致报错)
+        # 注意：如果 K=1，这里相当于自己除以自己，数值上没有实质变化。
         if self.config.norm_topk_prob: 
             topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
             
+        # 初始化一个全 0 的大矩阵 y，用来装所有专家计算完后的最终总输出
         y = torch.zeros_like(x_flat)
-        # 4. 遍历所有专家，将分配给该专家的 Token 挑出来计算，最后回填累加
+
+        # ----------------------------------------------------
+        # 步骤 4: 遍历每个专家，把属于它的活干完，合并结果
+        # ----------------------------------------------------
         for i, expert in enumerate(self.experts):
-            # 掩码筛选当前分派到第 i 个专家的 Token
+            # mask 的意思是：看看有哪些 Token 的 topk_idx 正好等于当前专家的编号 i
             mask = (topk_idx == i)
-            if mask.any():
+            
+            if mask.any(): # 如果有 Token 被分配给了当前这个专家 i
+                # 找到这些 Token 在大矩阵中的具体行索引（位置）
                 token_idx = mask.any(dim=-1).nonzero().flatten()
+                
+                # 提取出这些 Token 对应的路由权重
                 weight = topk_weight[mask].view(-1, 1)
-                # 计算该专家在该批 Token 上的输出结果，乘以路由权重后，利用 index_add_ 累加回总输出
+                
+                # 核心计算：
+                # 1. x_flat[token_idx]：把属于这个专家的 Token 筛选出来。
+                # 2. expert(...)：让这个专家只计算这批属于它的 Token（高效！没分到的不计算）。
+                # 3. * weight：计算结果乘以它应得的路由权重。
+                # 4. y.index_add_(...)：把计算好的结果，精准地“累加回”总输出矩阵 y 的对应位置上。
                 y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
+                
             elif self.training:
-                # 训练中若某专家没有被分到 Token，执行虚拟梯度反传以防止 PyTorch DDP 分布式报未参与计算错
+                # 这是一个防报错的 Trick（冷知识）：
+                # 在多卡训练时，如果某个专家很不幸一个 Token 也没分到，它就不会参与计算。
+                # PyTorch 的分布式训练（DDP）会报错说“这个专家怎么没梯度？”
+                # 所以这里让它乘以 0 产生一个虚拟梯度，骗过 PyTorch，防止报错。
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
                 
-        # 5. 辅助损失函数 (Auxiliary Loss) 计算，强制鼓励 Token 均匀分配给每个专家，避免单一专家独占
+        # ----------------------------------------------------
+        # 步骤 5: 负载均衡控制 (Auxiliary Loss)
+        # ----------------------------------------------------
         if self.training and self.config.router_aux_loss_coef > 0:
+            # 计算每个专家实际分到的 Token 比例 (load) 和 概率平均值 (scores)
             load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+            # 算出一个惩罚项（越不均匀，这个 loss 就越大），强迫路由器“雨露均沾”
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
         else:
             self.aux_loss = scores.new_zeros(1).squeeze()
             
-        return y.view(batch_size, seq_len, hidden_dim) # 还原为原始的三维形状
+        # 最后，把拍扁的二维矩阵还原回原本的三维形状 [BatchSize, SeqLen, HiddenDim] 返回
+        return y.view(batch_size, seq_len, hidden_dim)
 
 class MiniMindBlock(nn.Module):
     """
@@ -647,20 +705,31 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             # 惩罚项控制：对已经出现过的 Token 的概率强行进行除以惩罚系数的衰减
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
-                    seen = torch.unique(input_ids[i])
-                    score = logits[i, seen]
+                    seen = torch.unique(input_ids[i]) # 1. 找出这句里已经出现过哪些词
+                    score = logits[i, seen]           # 2. 把这些老词当前的得分抽出来
+                    # 3. 强行降低它们的得分
                     logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
                     
             # Top-K 采样过滤掉分值太低的候选词
             if top_k > 0: 
-                logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
+                # 1. 找到第 K 名的得分是多少
+                k_th_score = torch.topk(logits, top_k)[0][..., -1, None]
+                # 2. 谁的得分比第 K 名还低，直接打入十八层地狱（变成负无穷）
+                logits[logits < k_th_score] = -float('inf')
                 
             # Top-P (Nucleus) 核采样过滤累计概率外的多余词
             if top_p < 1.0:
+                # 1. 把所有词按得分从高到低排个序
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                
+                # 2. 算一下从高到低的“累计概率”
+                # 看看加到哪个词的时候，总概率超过了 top_p（比如 0.9）
                 mask = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) > top_p
-                # 至少保留第一个候选词，以防全部被 mask
+                
+                # 3. 极其精妙的一步：把 Mask 矩阵向右平移一位，并确保第一个词永远不被屏蔽
                 mask[..., 1:], mask[..., 0] = mask[..., :-1].clone(), 0
+                
+                # 4. 把这个“淘汰名单”映射回原本未排序的词表里，把落榜者全部变成负无穷
                 logits[mask.scatter(1, sorted_indices, mask)] = -float('inf')
                 
             # 从过滤后的概率分布中采样或者直接取最大分值词 (Argmax)
